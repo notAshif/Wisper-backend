@@ -4,10 +4,11 @@ import fs from "node:fs"
 const CHANNELS_COUNT = 1;
 const SAMPLE_FORMAT = portAudio.SampleFormat16Bit;
 const SAMPLE_RATE = 48_000;
+// 8 bits and bytes => 8 / 16
 
 const devices = portAudio.getDevices()
 
-const chunk: Buffer[] = [];
+const chunks: Buffer[] = [];
 
 /**
  * 1 Microphone (AB13X USB Audio)
@@ -28,8 +29,9 @@ const Microphone = portAudio.AudioIO({
     }
 })
 
-Microphone.on("data", (chunks: Buffer) => {
-    console.log(`Received chunk ${chunks.length} bytes`)
+Microphone.on("data", (chunk: Buffer) => {
+    chunks.push(chunk)
+    console.log(`Received chunk ${chunk.length} bytes`)
 })
 
 Microphone.on("error", (err: any) => {
@@ -47,7 +49,9 @@ Microphone.on("SIGINT", () => {
     console.log('Received SIGINT. Stopping recording.');
     Microphone.quit();
 
-    const pcmData = Buffer.concat(chunk)
-
+    const pcmData = Buffer.concat(chunks)
+    console.log("pcm data:", pcmData.length)
     process.exit(0);
 })
+
+//TODO:: Implement createWavFile() function -> headers ofn pcm audio....
