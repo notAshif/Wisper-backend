@@ -13,7 +13,8 @@
     "rootDir": ".",
     "sourceMap": true,
     "removeComments": false,
-    "noEmit": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
 
     /* Interop Constraints */
     "esModuleInterop": true,
