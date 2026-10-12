@@ -1,6 +1,32 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { SAMPLE_RATE, CHANNELS_COUNT, BITS_PER_SAMPLE } from "./audio.ts";
+import { ContextEngine } from "./context.ts";
 import "dotenv/config"
+
+interface BaseTranscribeOptions {
+    language?: string;
+    prompt?: string;
+    temperature?: number;
+    responseFormat?: "json" | "text" | "verbose_json";
+}
+
+interface GroqTranscribeOptions extends BaseTranscribeOptions {
+    apiKey?: string;
+    model?: "whisper-large-v3" | "whisper-large-v3-turbo" | string;
+}
+
+interface TranscribeOptions extends BaseTranscribeOptions {
+    provider?: "groq";
+    apiKey?: string;
+    model?: string;
+}
+
+interface LiveTranscriberOptions extends TranscribeOptions {
+    chunkDurationMs?: number;
+    overlapDurationMs?: number;
+    onText: (text: string) => void;
+    onError: (error: Error) => void;
+}
 
 export function createWavFile(
     pcmData: Buffer,
@@ -53,24 +79,8 @@ function toWavBuffer(audio: Buffer): Buffer {
     return createWavFile(audio, SAMPLE_RATE, CHANNELS_COUNT, BITS_PER_SAMPLE);
 }
 
-interface BaseTranscribeOptions {
-    language?: string;
-    prompt?: string;
-    temperature?: number;
-    responseFormat?: "json" | "text" | "verbose_json";
-}
-
-interface GroqTranscribeOptions extends BaseTranscribeOptions {
-    apiKey?: string;
-    model?: "whisper-large-v3" | "whisper-large-v3-turbo" | string;
-}
 
 
-export interface TranscribeOptions extends BaseTranscribeOptions {
-    provider?: "groq";
-    apiKey?: string;
-    model?: string;
-}
 
 export async function transcribeWithGroq(
     audio: Buffer,
@@ -137,6 +147,142 @@ export async function transcribeWithGroq(
 
     const data = (await response.json()) as { text?: string };
     return data.text || "";
+}
+
+export class LiveTranscriber {
+    private readonly context = new ContextEngine();
+    private readonly chunkBytes: number;
+    private readonly overlapBytes: number;
+    private readonly newAudioBytesPerChunk: number;
+    private readonly onText: (text: string) => void;
+    private readonly onError: (error: Error) => void;
+    private readonly requestOptions: GroqTranscribeOptions;
+    private bufferedChunks: Buffer[] = [];
+    private bufferedBytes = 0;
+    private previousOverlap = Buffer.alloc(0);
+    private hasPreviousWindow = false;
+    private stopped = false;
+    private failed = false;
+    private transcriptionQueue: Promise<void> = Promise.resolve();
+
+    constructor(options: LiveTranscriberOptions) {
+        const {
+            chunkDurationMs = 5_000,
+            overlapDurationMs = 500,
+            onText,
+            onError,
+            apiKey,
+            model,
+            language,
+            prompt,
+            temperature,
+            responseFormat,
+        } = options;
+        const bytesPerFrame = CHANNELS_COUNT * (BITS_PER_SAMPLE / 8);
+
+        if (!Number.isFinite(chunkDurationMs) || !Number.isFinite(overlapDurationMs)) {
+            throw new Error("Live transcription durations must be finite numbers.");
+        }
+
+        this.chunkBytes = Math.floor(SAMPLE_RATE * chunkDurationMs / 1_000 / bytesPerFrame) * bytesPerFrame;
+        this.overlapBytes = Math.floor(SAMPLE_RATE * overlapDurationMs / 1_000 / bytesPerFrame) * bytesPerFrame;
+        if (this.chunkBytes <= 0 || this.overlapBytes < 0 || this.overlapBytes >= this.chunkBytes) {
+            throw new Error("Invalid live transcription chunk or overlap duration.");
+        }
+
+        this.newAudioBytesPerChunk = this.chunkBytes - this.overlapBytes;
+        this.onText = onText;
+        this.onError = onError;
+        this.requestOptions = { apiKey, model, language, prompt, temperature, responseFormat };
+    }
+
+    get cleanupContext(): ContextEngine {
+        return this.context;
+    }
+
+    push(pcmChunk: Buffer): void {
+        if (this.stopped || this.failed || pcmChunk.length === 0) return;
+
+        this.bufferedChunks.push(Buffer.from(pcmChunk));
+        this.bufferedBytes += pcmChunk.length;
+
+        while (this.bufferedBytes >= (this.hasPreviousWindow ? this.newAudioBytesPerChunk : this.chunkBytes)) {
+            const requiredBytes = this.hasPreviousWindow ? this.newAudioBytesPerChunk : this.chunkBytes;
+            const newAudio = this.takeBufferedBytes(requiredBytes);
+            const window = this.hasPreviousWindow
+                ? Buffer.concat([this.previousOverlap, newAudio])
+                : newAudio;
+
+            this.previousOverlap = Buffer.from(window.subarray(Math.max(0, window.length - this.overlapBytes)));
+            this.hasPreviousWindow = true;
+            this.enqueue(window);
+        }
+    }
+
+    async stop(): Promise<void> {
+        if (!this.stopped) {
+            this.stopped = true;
+            if (this.bufferedBytes >= 2) {
+                const remainingAudio = this.takeBufferedBytes(this.bufferedBytes - (this.bufferedBytes % 2));
+                const finalWindow = this.hasPreviousWindow
+                    ? Buffer.concat([this.previousOverlap, remainingAudio])
+                    : remainingAudio;
+                this.enqueue(finalWindow);
+            }
+            this.bufferedChunks = [];
+            this.bufferedBytes = 0;
+            this.previousOverlap = Buffer.alloc(0);
+        }
+
+        await this.transcriptionQueue;
+    }
+
+    private takeBufferedBytes(length: number): Buffer {
+        const result = Buffer.allocUnsafe(length);
+        let written = 0;
+
+        while (written < length) {
+            const first = this.bufferedChunks[0];
+            const count = Math.min(first.length, length - written);
+            first.copy(result, written, 0, count);
+            written += count;
+            this.bufferedBytes -= count;
+
+            if (count === first.length) {
+                this.bufferedChunks.shift();
+            } else {
+                this.bufferedChunks[0] = first.subarray(count);
+            }
+        }
+
+        return result;
+    }
+
+    private enqueue(pcmAudio: Buffer): void {
+        if (pcmAudio.length < 2) return;
+
+        this.transcriptionQueue = this.transcriptionQueue.then(async () => {
+            if (this.failed) return;
+
+            try {
+                const prompt = this.context.prompt || this.requestOptions.prompt;
+                const text = await transcribeWithGroq(createWavFile(pcmAudio), {
+                    ...this.requestOptions,
+                    prompt,
+                });
+                const newText = this.context.append(text);
+                if (newText) this.onText(newText);
+            } catch (error) {
+                this.failed = true;
+                const normalizedError = error instanceof Error ? error : new Error(String(error));
+                try {
+                    this.onError(normalizedError);
+                } catch {
+                    
+                }
+            }
+        });
+    }
 }
 
 export async function transcribeAudio(

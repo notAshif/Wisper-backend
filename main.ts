@@ -1,9 +1,10 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { AudioCapture, listAudioDevices } from "./src/audio.ts";
-import { createWavFile, transcribeAudio, saveWavFile } from "./src/stt.ts";
+import { LiveTranscriber } from "./src/stt.ts";
+import { cleanTranscriptWithMindStudio } from "./src/mindstudio.ts";
 
-async function main() {
+async function main(): Promise<void> {
     if (typeof process.loadEnvFile === "function") {
         try {
             process.loadEnvFile();
@@ -11,60 +12,79 @@ async function main() {
         }
     }
 
-    console.log("=== Whisper Backend STT Demo ===\n");
-
     const groqKey = process.env.GROQ_API_KEY?.trim();
-    // const openrouterKey = process.env.OPENROUTER_API_KEY?.trim();
-
-    if (groqKey) {
-        console.log("Using Provider: Groq (whisper-large-v3, 100% Free)");
-    }  else {
-        console.log("Notice: No API key detected. Please add GROQ_API_KEY to your .env file.");
+    if (!groqKey) {
+        throw new Error("Add GROQ_API_KEY to your .env file to transcribe microphone audio.");
+    }
+    if (!process.env.MINDSTUDIO_API_KEY?.trim()) {
+        throw new Error("Add MINDSTUDIO_API_KEY to your .env file to format the final transcript.");
     }
 
-    listAudioDevices();
+    const devices = listAudioDevices();
+    if (devices.length === 0) {
+        throw new Error("No audio input devices are available.");
+    }
 
-    const deviceId = 1;
-    const recorder = new AudioCapture(deviceId);
+    const configuredDeviceId = process.env.AUDIO_DEVICE_ID?.trim();
+    const deviceId = configuredDeviceId ? Number(configuredDeviceId) : devices[0].id;
+    if (!Number.isInteger(deviceId) || !devices.some((device) => device.id === deviceId)) {
+        throw new Error("AUDIO_DEVICE_ID must match an available microphone device ID.");
+    }
+
+    const recorder = new AudioCapture({ deviceId, retainAudio: false });
+    const chunkDurationSeconds = Number(process.env.GROQ_STT_CHUNK_SECONDS || 5);
+    let transcriptionError: Error | undefined;
+    let microphoneError: Error | undefined;
+    const transcriber = new LiveTranscriber({
+        apiKey: groqKey,
+        chunkDurationMs: chunkDurationSeconds * 1_000,
+        onText: (text) => process.stdout.write(text),
+        onError: (error) => {
+            transcriptionError = error;
+        },
+    });
+
+    let capturedBytes = 0;
+    const unsubscribeChunk = recorder.onChunk((chunk) => {
+        capturedBytes += chunk.length;
+        transcriber.push(chunk);
+    });
+    const unsubscribeError = recorder.onError((error) => {
+        microphoneError = error instanceof Error ? error : new Error(String(error));
+    });
 
     const rl = createInterface({ input, output });
 
-    console.log(`\nReady to record on device ID: ${deviceId}`);
-    await rl.question("Press [Enter] to START recording...");
-
-    recorder.start();
-
-    await rl.question("Recording in progress... Press [Enter] to STOP recording.\n");
-
-    const pcmData = recorder.stop();
-
-    if (pcmData.length === 0) {
-        console.log("No audio recorded.");
-        rl.close();
-        return;
-    }
-
-    console.log(`Captured ${pcmData.length} bytes of raw PCM audio.`);
-
-    const wavBuffer = createWavFile(pcmData);
-    console.log(`Created WAV file buffer (${wavBuffer.length} bytes).`);
-
-    const outputFilename = "test_recording.wav";
-    await saveWavFile(outputFilename, wavBuffer);
-    console.log(`Saved audio locally to ${outputFilename}`);
-
-    console.log("\nTranscribing audio with Whisper Large v3...");
-
     try {
-        const text = await transcribeAudio(wavBuffer);
-        console.log("\n================ TRANSCRIPTION ================");
-        console.log(text);
-        console.log("===============================================\n");
-    } catch (err: any) {
-        console.error("\nTranscription error:", err.message);
+        await rl.question("Press Enter to start recording...");
+        recorder.start();
+        await rl.question("Recording. Press Enter to stop...");
+
+        recorder.stop();
+        if (microphoneError) {
+            throw new Error(`Microphone capture failed: ${microphoneError.message}`);
+        }
+        if (capturedBytes === 0) {
+            throw new Error("No audio was captured.");
+        }
+
+        await transcriber.stop();
+        if (transcriptionError) {
+            throw transcriptionError;
+        }
+
+        const finalText = await cleanTranscriptWithMindStudio(transcriber.cleanupContext);
+        process.stdout.write(`\n\n${finalText}\n`);
     } finally {
+        if (recorder.recording) recorder.stop();
+        unsubscribeChunk();
+        unsubscribeError();
         rl.close();
     }
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : "An unexpected error occurred.";
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+});

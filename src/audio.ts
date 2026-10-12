@@ -9,7 +9,16 @@ interface AudioCaptureOptions {
     deviceId?: number;
     sampleRate?: number;
     channelCount?: number;
+    retainAudio?: boolean;
 }
+
+interface AudioDeviceInfo {
+    id: number;
+    name: string;
+    maxInputChannels: number;
+    defaultSampleRate: number;
+}
+
 
 export class AudioCapture {
     private microphone: any = null;
@@ -18,24 +27,36 @@ export class AudioCapture {
     private deviceId: number;
     private sampleRate: number;
     private channelCount: number;
+    private retainAudio: boolean;
+    private chunkListeners = new Set<(chunk: Buffer) => void>();
+    private errorListeners = new Set<(error: unknown) => void>();
 
     constructor(deviceIdOrOptions: number | AudioCaptureOptions = 1) {
         if (typeof deviceIdOrOptions === "number") {
             this.deviceId = deviceIdOrOptions;
             this.sampleRate = SAMPLE_RATE;
             this.channelCount = CHANNELS_COUNT;
+            this.retainAudio = true;
         } else {
             this.deviceId = deviceIdOrOptions.deviceId ?? 1;
             this.sampleRate = deviceIdOrOptions.sampleRate ?? SAMPLE_RATE;
             this.channelCount = deviceIdOrOptions.channelCount ?? CHANNELS_COUNT;
+            this.retainAudio = deviceIdOrOptions.retainAudio ?? true;
         }
     }
 
+    onChunk(listener: (chunk: Buffer) => void): () => void {
+        this.chunkListeners.add(listener);
+        return () => this.chunkListeners.delete(listener);
+    }
+
+    onError(listener: (error: unknown) => void): () => void {
+        this.errorListeners.add(listener);
+        return () => this.errorListeners.delete(listener);
+    }
+
     start(): void {
-        if (this.isRecording) {
-            console.log("Already recording");
-            return;
-        }
+        if (this.isRecording) return;
 
         this.chunks = [];
         this.microphone = portAudio.AudioIO({
@@ -50,33 +71,38 @@ export class AudioCapture {
 
         this.microphone.on("data", (chunk: Buffer) => {
             if (this.isRecording) {
-                this.chunks.push(chunk);
+                const audioChunk = Buffer.from(chunk);
+                if (this.retainAudio) {
+                    this.chunks.push(audioChunk);
+                }
+                for (const listener of this.chunkListeners) {
+                    listener(audioChunk);
+                }
             }
         });
 
         this.microphone.on("error", (err: any) => {
-            console.error("Microphone error:", err?.message || err);
+            this.isRecording = false;
+            for (const listener of this.errorListeners) {
+                listener(err);
+            }
         });
 
         this.isRecording = true;
         this.microphone.start();
-        console.log("Microphone started. Please speak into your microphone...");
     }
 
     stop(): Buffer {
-        if (!this.isRecording) {
-            console.log("Not recording");
-            return Buffer.alloc(0);
-        }
+        if (!this.isRecording && !this.microphone) return Buffer.alloc(0);
 
         this.isRecording = false;
         if (this.microphone) {
-            this.microphone.quit();
+            const microphone = this.microphone;
             this.microphone = null;
+            microphone.quit();
         }
 
         const pcmData = Buffer.concat(this.chunks);
-        console.log("Microphone stopped. PCM data length:", pcmData.length);
 
         return pcmData;
     }
@@ -94,18 +120,10 @@ export function createAudioCapture(deviceIdOrOptions: number | AudioCaptureOptio
     return new AudioCapture(deviceIdOrOptions);
 }
 
-interface AudioDeviceInfo {
-    id: number;
-    name: string;
-    maxInputChannels: number;
-    defaultSampleRate: number;
-}
-
 export function listAudioDevices(): AudioDeviceInfo[] {
     const devices = portAudio.getDevices();
     const inputDevices: AudioDeviceInfo[] = [];
 
-    console.log("Available audio input devices:");
     for (const device of devices) {
         if (device.maxInputChannels > 0) {
             inputDevices.push({
@@ -114,7 +132,6 @@ export function listAudioDevices(): AudioDeviceInfo[] {
                 maxInputChannels: device.maxInputChannels,
                 defaultSampleRate: device.defaultSampleRate,
             });
-            console.log(`  ID: ${device.id}, Name: ${device.name}`);
         }
     }
 
